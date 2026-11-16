@@ -7,6 +7,11 @@
  * リーダー表示: 記事の本文だけを取り出し、ダーク配色の読みやすいページとして返します。
  * 元ページ表示: 埋め込み禁止のヘッダーを外し、スクリプトを除去して返します。
  *
+ * 追加機能(時計ページの通信を中継):
+ *   https://<your-worker>.workers.dev/api?u=<APIのURL(URLエンコード)>   … 許可リストのAPIをGETで中継(短時間キャッシュ)
+ *   wss://<your-worker>.workers.dev/ws                                   … 地震情報(P2P地震情報)のWebSocketを中継
+ * 取得先には、利用者の端末ではなくこのWorkerからのアクセスとして見えます。
+ *
  * 取得を許可するのは許可リストのドメインだけです。個人利用の範囲で使い、
  * 各社の利用規約を確認してください(転載・再配布はしないでください)。
  */
@@ -16,6 +21,17 @@ const ALLOWED_HOSTS = ["nhk.or.jp", "news.web.nhk", "news.yahoo.co.jp"];
 // このプロキシのページを埋め込んでよいサイト(CSPのframe-ancestors)。
 // 時計ページの置き場所が決まったら "https://your-clock.example.com" のように絞ってください。
 const FRAME_ANCESTORS = "https://user-x45.github.io";
+
+// 時計ページのAPI中継(/api)で許可するホストと、Cloudflare側のキャッシュ秒数
+const API_HOSTS = {
+  "api.open-meteo.com": 300,
+  "api.rss2json.com": 600,
+  "ultimatecrazy.jp": 3600,
+};
+// 地震情報のWebSocket中継(/ws)の接続先
+const EQ_UPSTREAM = "https://api.p2pquake.net/v2/ws";
+// 時計ページのオリジン(CORSとWebSocketの接続元チェック)
+const PAGE_ORIGIN = "https://user-x45.github.io";
 
 const MAX_REDIRECTS = 4;
 const MAX_BYTES = 5 * 1024 * 1024;
@@ -258,12 +274,81 @@ function raw(res, type, finalUrl, selfOrigin, isHead) {
   return rewriter.transform(new Response(isHead ? null : res.body, { status: 200, headers }));
 }
 
+/* ---------------- API中継(/api)と地震情報WebSocket中継(/ws) ---------------- */
+
+const corsHeaders = () => ({
+  "Access-Control-Allow-Origin": PAGE_ORIGIN,
+  "Vary": "Origin",
+});
+
+function originOk(request) {
+  const o = request.headers.get("Origin");
+  return !o || o === PAGE_ORIGIN;
+}
+
+async function apiProxy(request, self) {
+  if (!originOk(request)) return text(403, "このオリジンからは使えません");
+  let u;
+  try {
+    u = new URL(self.searchParams.get("u") || "");
+  } catch {
+    return text(400, "u パラメータにAPIのURLを指定してください");
+  }
+  const ttl = API_HOSTS[u.hostname.toLowerCase()];
+  if (u.protocol !== "https:" || u.username || u.password || (u.port && u.port !== "443") || ttl === undefined) {
+    return text(403, "このAPIは中継できません(許可されていないホストです)");
+  }
+  let res;
+  try {
+    res = await fetch(u.href, {
+      redirect: "manual",
+      headers: { "Accept": "application/json", "User-Agent": UA },
+      cf: { cacheTtl: ttl, cacheEverything: true },
+    });
+  } catch {
+    return text(502, "取得に失敗しました");
+  }
+  if (res.status >= 300 && res.status < 400) return text(502, "リダイレクトは中継しません");
+  const headers = new Headers({
+    "Content-Type": res.headers.get("Content-Type") || "application/json",
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    ...corsHeaders(),
+  });
+  return new Response(res.body, { status: res.status, headers });
+}
+
+async function eqProxy(request) {
+  if (request.headers.get("Upgrade") !== "websocket") return text(426, "WebSocketで接続してください");
+  if (!originOk(request)) return text(403, "このオリジンからは使えません");
+  let up;
+  try {
+    up = await fetch(EQ_UPSTREAM, { headers: { Upgrade: "websocket" } });
+  } catch {
+    return text(502, "地震情報サーバーに接続できません");
+  }
+  const upstream = up.webSocket;
+  if (!upstream) return text(502, "地震情報サーバーに接続できません");
+  upstream.accept();
+  const [client, server] = Object.values(new WebSocketPair());
+  server.accept();
+  const safe = (c) => (c && c !== 1005 && c !== 1006 && c < 5000 ? c : 1000);
+  upstream.addEventListener("message", (e) => { try { server.send(e.data); } catch {} });
+  server.addEventListener("message", (e) => { try { upstream.send(e.data); } catch {} });
+  upstream.addEventListener("close", (e) => { try { server.close(safe(e.code), "upstream closed"); } catch {} });
+  server.addEventListener("close", (e) => { try { upstream.close(safe(e.code), "client closed"); } catch {} });
+  upstream.addEventListener("error", () => { try { server.close(1011, "upstream error"); } catch {} });
+  return new Response(null, { status: 101, webSocket: client });
+}
+
 /* ---------------- エントリポイント ---------------- */
 
 export default {
   async fetch(request) {
     if (request.method !== "GET" && request.method !== "HEAD") return text(405, "GETのみ対応しています");
     const self = new URL(request.url);
+    if (self.pathname === "/ws") return eqProxy(request);
+    if (self.pathname === "/api") return apiProxy(request, self);
     const rawUrl = self.searchParams.get("url");
     if (!rawUrl) return text(400, "url パラメータを指定してください");
     const target = parseTarget(rawUrl);
