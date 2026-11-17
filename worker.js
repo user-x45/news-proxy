@@ -11,6 +11,7 @@
  *   GET  /api/notices        … 一覧(新しい順)
  *   POST /api/notices        … 送信 {title, body}
  *   POST /api/notices/read   … 既読にする {ids:[...]}
+ *   POST /api/notices/delete … 削除する {ids:[...]}
  *   設定: KV namespace を「NOTICES」の名前でバインド(合言葉なし。URLを知っていれば誰でも読み書きできます)
  *
  * 取得を許可するのは許可リストのドメインだけです。個人利用の範囲で使い、
@@ -318,6 +319,12 @@ async function noticesApi(request, env, path) {
     for (const n of list) if (!n.readAt && ids.includes(n.id)) { n.readAt = t; changed = true; }
     if (changed) await save(list);
     return json(request, 200, { notices: list });
+  }
+  if (path === "/api/notices/delete") {
+    const ids = Array.isArray(data && data.ids) ? data.ids.map(String) : [];
+    const list = await load(), kept = list.filter((n) => !ids.includes(n.id));
+    if (kept.length !== list.length) await save(kept);
+    return json(request, 200, { notices: kept });
   }
   return json(request, 404, { error: "見つかりません" });
 }
