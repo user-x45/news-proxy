@@ -1,28 +1,7 @@
-/**
- * ニュース記事プロキシ(Cloudflare Workers)
- *
- *   https://<your-worker>.workers.dev/?url=<記事のURL(URLエンコード)>            … リーダー表示(既定)
- *   https://<your-worker>.workers.dev/?url=<記事のURL(URLエンコード)>&mode=raw   … 元ページをそのまま表示
- *
- * リーダー表示: 記事の本文だけを取り出し、ダーク配色の読みやすいページとして返します。
- * 元ページ表示: 埋め込み禁止のヘッダーを外し、スクリプトを除去して返します。
- *
- * お知らせ API(時計ページと send.html をつなぐ):
- *   GET  /api/notices        … 一覧(新しい順)
- *   POST /api/notices        … 送信 {title, body}
- *   POST /api/notices/read   … 既読にする {ids:[...]}
- *   POST /api/notices/delete … 削除する {ids:[...]}
- *   設定: KV namespace を「NOTICES」の名前でバインド(合言葉なし。URLを知っていれば誰でも読み書きできます)
- *
- * 取得を許可するのは許可リストのドメインだけです。個人利用の範囲で使い、
- * 各社の利用規約を確認してください(転載・再配布はしないでください)。
- */
-
 const ALLOWED_HOSTS = ["nhk.or.jp", "news.web.nhk", "news.yahoo.co.jp"];
 
-// このプロキシのページを埋め込んでよいサイト(CSPのframe-ancestors)。
-// 時計ページの置き場所が決まったら "https://your-clock.example.com" のように絞ってください。
 const FRAME_ANCESTORS = "https://user-x45.github.io";
+const API_ORIGINS = [FRAME_ANCESTORS, "https://portalite.f5.si"];
 
 const MAX_REDIRECTS = 4;
 const MAX_BYTES = 5 * 1024 * 1024;
@@ -79,7 +58,6 @@ const baseHeaders = (type, extraCsp = []) =>
     ].join("; "),
   });
 
-// リダイレクトは手動で追い、毎回ドメインを検証する(SSRF対策)
 async function load(target) {
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
     let res;
@@ -106,8 +84,6 @@ async function load(target) {
   }
   return { err: text(508, "リダイレクトが多すぎます") };
 }
-
-/* ---------------- リーダー表示 ---------------- */
 
 const clean = (s) => s.replace(/\s+/g, " ").trim();
 const SKIP = /^(©|Copyright|関連記事|関連ニュース|この記事を|広告)/i;
@@ -152,7 +128,6 @@ function fromJsonLd(raw) {
     try {
       walk(JSON.parse(r));
     } catch {
-      /* 無視 */
     }
   }
   return out;
@@ -188,7 +163,7 @@ async function reader(res, finalUrl) {
     .on("article p, main p, [itemprop=articleBody] p, [class*=article] p, [class*=Article] p, [class*=body] p, [class*=content] p", pref.handler)
     .on("p", all.handler);
 
-  await rw.transform(res).arrayBuffer(); // 解析のため読み切る
+  await rw.transform(res).arrayBuffer();
   title = clean(titleBuf);
 
   const j = fromJsonLd(ld);
@@ -235,8 +210,6 @@ ${body}
   return new Response(html, { status: 200, headers: baseHeaders("text/html; charset=utf-8", ["style-src 'unsafe-inline'"]) });
 }
 
-/* ---------------- 元ページ表示(mode=raw) ---------------- */
-
 function raw(res, type, finalUrl, selfOrigin, isHead) {
   const proxify = (href) => {
     if (!href || /^(javascript|mailto|tel|data):/i.test(href)) return null;
@@ -265,14 +238,12 @@ function raw(res, type, finalUrl, selfOrigin, isHead) {
   return rewriter.transform(new Response(isHead ? null : res.body, { status: 200, headers }));
 }
 
-/* ---------------- お知らせ API ---------------- */
-
 const NOTICE_MAX = 50, TITLE_MAX = 40, BODY_MAX = 300;
 
 function cors(request) {
   const o = request.headers.get("Origin");
   const h = { Vary: "Origin" };
-  if (o && o === FRAME_ANCESTORS) {
+  if (o && API_ORIGINS.includes(o)) {
     h["Access-Control-Allow-Origin"] = o;
     h["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS";
     h["Access-Control-Allow-Headers"] = "Content-Type";
@@ -328,8 +299,6 @@ async function noticesApi(request, env, path) {
   }
   return json(request, 404, { error: "見つかりません" });
 }
-
-/* ---------------- エントリポイント ---------------- */
 
 export default {
   async fetch(request, env) {
