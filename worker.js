@@ -305,7 +305,7 @@ async function noticesApi(request, env, path) {
   if (path === "/api/notices") {
     const title = String((data && data.title) || "").trim().slice(0, TITLE_MAX);
     const body = String((data && data.body) || "").trim().slice(0, BODY_MAX);
-    if (!title) return json(request, 400, { error: "タイトルを入力してください" });
+    if (!body) return json(request, 400, { error: "本文を入力してください" });
     const notice = { id: crypto.randomUUID(), title, body, createdAt: Date.now(), readAt: null };
     const list = [notice, ...(await load())].slice(0, NOTICE_MAX);
     await save(list);
