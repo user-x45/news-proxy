@@ -7,6 +7,12 @@
  * リーダー表示: 記事の本文だけを取り出し、ダーク配色の読みやすいページとして返します。
  * 元ページ表示: 埋め込み禁止のヘッダーを外し、スクリプトを除去して返します。
  *
+ * お知らせ API(時計ページと send.html をつなぐ):
+ *   GET  /api/notices        … 一覧(新しい順)
+ *   POST /api/notices        … 送信 {title, body}
+ *   POST /api/notices/read   … 既読にする {ids:[...]}
+ *   設定: KV namespace を「NOTICES」の名前でバインド(合言葉なし。URLを知っていれば誰でも読み書きできます)
+ *
  * 取得を許可するのは許可リストのドメインだけです。個人利用の範囲で使い、
  * 各社の利用規約を確認してください(転載・再配布はしないでください)。
  */
@@ -258,10 +264,70 @@ function raw(res, type, finalUrl, selfOrigin, isHead) {
   return rewriter.transform(new Response(isHead ? null : res.body, { status: 200, headers }));
 }
 
+/* ---------------- お知らせ API ---------------- */
+
+const NOTICE_MAX = 50, TITLE_MAX = 40, BODY_MAX = 300;
+
+function cors(request) {
+  const o = request.headers.get("Origin");
+  const h = { Vary: "Origin" };
+  if (o && o === FRAME_ANCESTORS) {
+    h["Access-Control-Allow-Origin"] = o;
+    h["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS";
+    h["Access-Control-Allow-Headers"] = "Content-Type";
+    h["Access-Control-Max-Age"] = "86400";
+  }
+  return h;
+}
+
+const json = (request, status, obj) =>
+  new Response(JSON.stringify(obj), {
+    status,
+    headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", ...cors(request) },
+  });
+
+async function noticesApi(request, env, path) {
+  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors(request) });
+  if (!env.NOTICES) return json(request, 501, { error: "KV(NOTICES)を設定してください" });
+
+  const load = async () => (await env.NOTICES.get("list", "json")) || [];
+  const save = (list) => env.NOTICES.put("list", JSON.stringify(list));
+
+  if (request.method === "GET" && path === "/api/notices") return json(request, 200, { notices: await load(), serverTime: Date.now() });
+  if (request.method !== "POST") return json(request, 405, { error: "対応していないメソッドです" });
+
+  const raw = await request.text();
+  if (raw.length > 8192) return json(request, 413, { error: "データが大きすぎます" });
+  let data;
+  try { data = JSON.parse(raw); } catch { return json(request, 400, { error: "JSONが正しくありません" }); }
+
+  if (path === "/api/notices") {
+    const title = String((data && data.title) || "").trim().slice(0, TITLE_MAX);
+    const body = String((data && data.body) || "").trim().slice(0, BODY_MAX);
+    if (!title) return json(request, 400, { error: "タイトルを入力してください" });
+    const notice = { id: crypto.randomUUID(), title, body, createdAt: Date.now(), readAt: null };
+    const list = [notice, ...(await load())].slice(0, NOTICE_MAX);
+    await save(list);
+    return json(request, 201, { notice, notices: list });
+  }
+
+  if (path === "/api/notices/read") {
+    const ids = Array.isArray(data && data.ids) ? data.ids.map(String) : [];
+    const list = await load(), t = Date.now();
+    let changed = false;
+    for (const n of list) if (!n.readAt && ids.includes(n.id)) { n.readAt = t; changed = true; }
+    if (changed) await save(list);
+    return json(request, 200, { notices: list });
+  }
+  return json(request, 404, { error: "見つかりません" });
+}
+
 /* ---------------- エントリポイント ---------------- */
 
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
+    const path = new URL(request.url).pathname;
+    if (path === "/api/notices" || path.startsWith("/api/notices/")) return noticesApi(request, env, path);
     if (request.method !== "GET" && request.method !== "HEAD") return text(405, "GETのみ対応しています");
     const self = new URL(request.url);
     const rawUrl = self.searchParams.get("url");
