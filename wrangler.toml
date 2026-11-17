@@ -1,3 +1,8 @@
 name = "news-proxy"
 main = "worker.js"
 compatibility_date = "2024-11-01"
+
+# お知らせの保存先。id は `npx wrangler kv namespace create NOTICES` の出力に置き換える
+[[kv_namespaces]]
+binding = "NOTICES"
+id = "e796bdf5f1fc469a83755a99324825ee"
