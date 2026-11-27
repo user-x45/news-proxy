@@ -300,9 +300,59 @@ async function noticesApi(request, env, path) {
   return json(request, 404, { error: "見つかりません" });
 }
 
+function same(a, b) {
+  if (a.length !== b.length) return false;
+  let d = 0;
+  for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return d === 0;
+}
+
+// 見守りカメラ: Originを確認してからDurable Objectへ中継(映像そのものはWorkerを通らず端末同士で直接届く)
+async function camApi(request, env) {
+  if (request.headers.get("Upgrade") !== "websocket") return text(426, "WebSocketで接続してください");
+  if (!env.CAM) return text(501, "CAM(Durable Object)を設定してください");
+  if (!API_ORIGINS.includes(request.headers.get("Origin") || "")) return text(403, "許可されていないオリジンです");
+  return env.CAM.get(env.CAM.idFromName("main")).fetch(request);
+}
+
+// role=cam(時計側) と role=view(スマホ側) のメッセージを互いに中継するだけ
+export class Cam {
+  constructor(state) {
+    this.state = state;
+    state.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+  }
+  tell(role, o) {
+    const m = JSON.stringify(o);
+    for (const s of this.state.getWebSockets(role)) try { s.send(m); } catch {}
+  }
+  async fetch(request) {
+    const role = new URL(request.url).searchParams.get("role") === "cam" ? "cam" : "view";
+    for (const s of this.state.getWebSockets(role)) try { s.close(1000, "replaced"); } catch {}
+    const [client, server] = Object.values(new WebSocketPair());
+    this.state.acceptWebSocket(server, [role]);
+    server.send(JSON.stringify({ t: "peer", on: this.state.getWebSockets(role === "cam" ? "view" : "cam").length > 0 }));
+    if (role === "cam") this.tell("view", { t: "peer", on: true });
+    return new Response(null, { status: 101, webSocket: client });
+  }
+  webSocketMessage(ws, msg) {
+    if (typeof msg !== "string" || msg.length > 16384) return;
+    let role; try { [role] = this.state.getTags(ws); } catch { return; }
+    for (const s of this.state.getWebSockets(role === "cam" ? "view" : "cam")) try { s.send(msg); } catch {}
+  }
+  webSocketClose(ws) { this.gone(ws); }
+  webSocketError(ws) { this.gone(ws); }
+  gone(ws) {
+    let role; try { [role] = this.state.getTags(ws); } catch { return; }
+    try { ws.close(); } catch {}
+    if (this.state.getWebSockets(role).some((s) => s !== ws)) return;
+    this.tell(role === "cam" ? "view" : "cam", role === "cam" ? { t: "peer", on: false } : { t: "bye" });
+  }
+}
+
 export default {
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
+    if (path === "/api/cam") return camApi(request, env);
     if (path === "/api/notices" || path.startsWith("/api/notices/")) return noticesApi(request, env, path);
     if (request.method !== "GET" && request.method !== "HEAD") return text(405, "GETのみ対応しています");
     const self = new URL(request.url);
