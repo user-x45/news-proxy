@@ -310,29 +310,53 @@ function same(a, b) {
 // 見守りカメラ: Originを確認してからDurable Objectへ中継(映像そのものはWorkerを通らず端末同士で直接届く)
 async function camApi(request, env) {
   if (request.headers.get("Upgrade") !== "websocket") return text(426, "WebSocketで接続してください");
-  if (!env.CAM) return text(501, "CAM(Durable Object)を設定してください");
+  if (!env.CAM || !/^\d{6}$/.test(String(env.CAM_PIN || "").trim())) return text(501, "CAM(Durable Object)と6桁のCAM_PINを設定してください");
   if (!API_ORIGINS.includes(request.headers.get("Origin") || "")) return text(403, "許可されていないオリジンです");
   return env.CAM.get(env.CAM.idFromName("main")).fetch(request);
 }
 
 // role=cam(時計側) と role=view(スマホ側) のメッセージを互いに中継するだけ
 export class Cam {
-  constructor(state) {
+  constructor(state, env) {
     this.state = state;
+    this.env = env;
     state.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
   tell(role, o) {
     const m = JSON.stringify(o);
     for (const s of this.state.getWebSockets(role)) try { s.send(m); } catch {}
   }
+  // スマホ側(view)だけ6桁パスコードを確認。パスコードは URL ではなく Sec-WebSocket-Protocol ("pin.123456") で受け取る。
+  // 総当たり対策: 同一IPは5回、全体では20回の失敗で15分間ロック(正しい入力でもロック中は通らない)
+  async guard(request, proto) {
+    const code = proto.startsWith("pin.") ? proto.slice(4) : "";
+    const ip = request.headers.get("CF-Connecting-IP") || "?", now = Date.now(), W = 15 * 60e3, st = this.state.storage;
+    const g = (await st.get("fail:all")) || { n: 0, t: 0 }, p = (await st.get("fail:" + ip)) || { n: 0, t: 0 };
+    if (now - g.t > W) g.n = 0;
+    if (now - p.t > W) p.n = 0;
+    if (g.n >= 20 || p.n >= 5) return "locked";
+    if (/^\d{6}$/.test(code) && same(code, String(this.env.CAM_PIN).trim())) { if (p.n) await st.delete("fail:" + ip); return ""; }
+    g.n++; g.t = now; p.n++; p.t = now;
+    await st.put({ "fail:all": g, ["fail:" + ip]: p });
+    return "bad";
+  }
+  deny(why, proto) {
+    const [client, server] = Object.values(new WebSocketPair());
+    server.accept();
+    server.send(JSON.stringify({ t: "auth", ok: false, locked: why === "locked" }));
+    server.close(4001, "auth");
+    return new Response(null, { status: 101, webSocket: client, headers: proto ? { "Sec-WebSocket-Protocol": proto } : {} });
+  }
   async fetch(request) {
     const role = new URL(request.url).searchParams.get("role") === "cam" ? "cam" : "view";
+    const proto = (request.headers.get("Sec-WebSocket-Protocol") || "").split(",")[0].trim();
+    if (role === "view") { const why = await this.guard(request, proto); if (why) return this.deny(why, proto); }
     for (const s of this.state.getWebSockets(role)) try { s.close(1000, "replaced"); } catch {}
     const [client, server] = Object.values(new WebSocketPair());
     this.state.acceptWebSocket(server, [role]);
     server.send(JSON.stringify({ t: "peer", on: this.state.getWebSockets(role === "cam" ? "view" : "cam").length > 0 }));
     if (role === "cam") this.tell("view", { t: "peer", on: true });
-    return new Response(null, { status: 101, webSocket: client });
+    return new Response(null, { status: 101, webSocket: client, headers: proto ? { "Sec-WebSocket-Protocol": proto } : {} });
   }
   webSocketMessage(ws, msg) {
     if (typeof msg !== "string" || msg.length > 16384) return;
